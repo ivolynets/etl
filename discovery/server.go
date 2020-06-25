@@ -1,175 +1,281 @@
 package discovery
 
 import (
+	"errors"
 	"fmt"
 	"log"
 	"net"
 	"os"
 	"sync"
 	"time"
+
+	_net "github.com/ivolynets/etl/internal/net"
 )
 
 // TODO: move logging capabilities to separate package
-var infoLog *log.Logger = log.New(os.Stdout, "discovery: ", log.LstdFlags|log.Lmicroseconds|log.Lmsgprefix)
-var errorLog *log.Logger = log.New(os.Stderr, "discovery: ", log.LstdFlags|log.Lmicroseconds|log.Lmsgprefix)
 
-// Server serves requests from other nodes in the grid.
+// Info level logger which outputs messages to the system standard output.
+var serverInfoLog *log.Logger = log.New(os.Stdout, "discovery_server: ", log.LstdFlags|log.Lmicroseconds|log.Lmsgprefix)
+
+// Error level logger which outputs messages to the system error output.
+var serverErrorLog *log.Logger = log.New(os.Stderr, "discovery_server: ", log.LstdFlags|log.Lmicroseconds|log.Lmsgprefix)
+
+// server encapsulates the structure of the server to protect its internal
+// state from explicit manipulation.
+type server struct {
+	conn _net.UDPConn  // UDP connection
+	buf  chan *Request // input requests buffer
+	ctl  chan byte     // control channel used for goroutines synchronization
+}
+
+// Server serves discovery requests from other nodes in the grid.
 type Server struct {
-	conn *net.UDPConn
-	buf  chan *Request
-	mux  sync.Mutex
+	server
 }
 
-// Request represents a request for quotes from the other nodes.
-type Request struct {
-	addr *net.UDPAddr
-	data string
-}
+// StartServer launches the discovery server which is listening to the given
+// UDP port.
+//
+// This is a non-blocking method which runs the server in a separate goroutine.
+// In order to shutdown the server please call Stop() method.
+//
+// Please note, the server does not allow to use either system or dynamic port
+// numbers, only the range of port numbers from 1024 through 49151 are allowed
+// for use.
+func StartServer(port int) (*Server, error) {
 
-// NewServer initializes a new discobvery server instance and returns a pointer
-// to it.
-func NewServer() *Server {
-	return &Server{}
-}
-
-// Start launches the discovery server which is listening to the address and
-// port specified in addr. This is a blocking method, if you want the server to
-// be started in the background then call this method in separate goroutine. In
-// this case don't forget to defer Stop method call.
-func (s *Server) Start(addr string) error {
+	// validate input
+	if port < 1024 || port > 49151 {
+		return nil, errors.New("the use of system or dynamic ports is prohibited")
+	}
 
 	// initialize the server
 
-	infoLog.Println("starting server...")
-	if err := s.init(addr); err != nil {
-		errorLog.Println(err)
-		return err
-	}
-	infoLog.Println("server started")
+	serverInfoLog.Printf("starting server on port %d ...\n", port)
+	var caddr *net.UDPAddr
+	var conn _net.UDPConn
+	var err error
 
-	// listen to incoming requests
-
-	buf := make([]byte, 1024)
-
-	for {
-		if req, ok, err := s.read(buf); !ok {
-			break // server has been stopped
-		} else if err == nil {
-
-			n := 0
-			if req != nil {
-				n = len(req.data)
-				s.buf <- req
-			}
-
-			infoLog.Printf("read_bytes = %d\n", n)
-
-		} else {
-			errorLog.Println(err)
-			return err
-		}
+	if caddr, err = _net.ResolveUDPAddr("udp", fmt.Sprintf(":%d", port)); err != nil {
+		return nil, err
 	}
 
-	return nil
+	if conn, err = _net.ListenUDP("udp", caddr); err != nil {
+		return nil, err
+	}
+
+	// TODO: make channel buffer size configurable if needed
+	s := &Server{server{
+		conn: conn,
+		buf:  make(chan *Request),
+		ctl:  make(chan byte),
+	}}
+
+	// start main and worker goroutines
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+
+	go s.handleRequests(&wg)
+	go s.run(&wg)
+
+	serverInfoLog.Println("server started")
+	return s, nil
 }
 
 // Stop shuts down the discovery server.
 func (s *Server) Stop() error {
-
-	s.mux.Lock()
-	defer s.mux.Unlock()
-
-	if s.conn == nil {
-		msg := "server is not running"
-		errorLog.Println(msg)
-		return fmt.Errorf(msg)
-	}
-
-	infoLog.Println("stopping server...")
-
-	close(s.buf)
-	s.conn.Close()
-	s.conn = nil
-
-	infoLog.Println("server is stopped")
+	serverInfoLog.Println("stopping server ...")
+	s.ctl <- 0
 	return nil
 }
 
-// init performs initialization of the discovery server.
-func (s *Server) init(addr string) error {
+// run is listening to incoming requests and puts them into the input channel
+// for further processing. This method blocks until the Close() method is
+// called.
+func (s *Server) run(wg *sync.WaitGroup) {
 
-	s.mux.Lock()
-	defer s.mux.Unlock()
+	defer s.conn.Close() // close connection when the server is stopped
 
-	if s.conn != nil {
-		return fmt.Errorf("server is already running")
-	}
+	// listen to incoming requests
 
-	var udpAddr *net.UDPAddr
-	var err error
+	buf := make([]byte, 256) // TODO: revise buffer size or make it configurable
 
-	if udpAddr, err = net.ResolveUDPAddr("udp", addr); err != nil {
-		return err
-	}
+	for {
+		select {
+		case <-s.ctl:
 
-	if s.conn, err = net.ListenUDP("udp", udpAddr); err != nil {
-		return err
-	}
+			// stop goroutines
 
-	// TODO: make queue size configurable
-	s.buf = make(chan *Request)
+			close(s.buf) // close input channel for writes
+			wg.Wait()    // wait until backlog is drained
 
-	// go routine for datagrams handling
+			serverInfoLog.Println("server is stopped")
+			return
 
-	go func() {
-		for {
-			if req, ok := <-s.buf; ok {
-				infoLog.Printf("addr = %s, data = %s\n", req.addr, req.data)
+		default:
+			if n, addr, err := s.read(buf); err == nil {
+				if n > 0 {
+					serverInfoLog.Printf("read_bytes = %d, addr = %s\n", n, addr)
+					var req *Request
+					if req, err = deserialize(buf[0:n], addr); err == nil {
+						s.buf <- req
+					} else {
+						serverErrorLog.Println(err)
+					}
+				}
 			} else {
-				// server is stopped
-				return
+				serverErrorLog.Println(err)
 			}
 		}
-	}()
-
-	return nil
+	}
 }
 
-// read reads the request from the connection. This function is timing out if
-// no bytes have been received during past second, in this case the nil
-// reference to request is returned. The second return parameter is always
-// true unless the server was stopped during the last attempt and connection
-// was closed.
-func (s *Server) read(buf []byte) (*Request, bool, error) {
+// read reads the request from the connection. It populates received data into
+// the given buffer and returns a number of received bytes as a first parameter.
+// This function is timing out if no bytes have been received during the past
+// second, in this case the 0 received bytes is returned.
+func (s *Server) read(buf []byte) (int, *net.UDPAddr, error) {
+
+	// validate input
+
+	if len(buf) == 0 {
+		return 0, nil, errors.New("read buffer cannot be nil or of 0 size")
+	}
+
+	// read datagram
 
 	var n int
 	var addr *net.UDPAddr
 	var err error
 
-	s.mux.Lock()
-	defer s.mux.Unlock()
-
-	if s.conn == nil {
-		return nil, false, nil
-	}
-
 	// TODO: make read timeout configurable
 	if err = s.conn.SetReadDeadline(time.Now().Add(time.Second)); err == nil {
-		n, addr, err = s.conn.ReadFromUDP(buf)
-	}
-
-	if err != nil {
-		// ignore timeout error
-		if netErr, ok := err.(net.Error); !ok || !netErr.Timeout() {
-			return nil, true, err
+		if n, addr, err = s.conn.ReadFromUDP(buf); err != nil {
+			// ignore timeout error
+			if netErr, ok := err.(net.Error); !ok || !netErr.Timeout() {
+				return 0, addr, err
+			}
 		}
+		// please note that according to documentation even though timeout
+		// occurred the portion of bytes still might have been read
+		return n, addr, nil
 	}
 
-	if n > 0 {
-		data := make([]byte, n)
-		copy(data, buf[0:n])
-		return &Request{addr, string(data)}, true, nil
+	return 0, nil, err
+}
+
+// write sends a message to the destination UDP address and returns a number of
+// bytes sent.
+func (s *Server) write(data []byte, addr *net.UDPAddr) (n int, err error) {
+
+	// validate input
+
+	if len(data) == 0 {
+		return 0, errors.New("cannot send empty data")
 	}
 
-	return nil, true, nil
+	if addr == nil {
+		return 0, errors.New("unknown destination address")
+	}
+
+	// send message
+
+	if n, err = s.conn.WriteToUDP(data, addr); err == nil {
+		serverInfoLog.Printf("sent_bytes = %d, addr = %s\n", n, addr)
+	}
+
+	return
+}
+
+// handleRequests processes all the inquiries which are coming from other nodes.
+// It is running in separate goroutine and pushing results into the output
+// channel so that another goroutine handleResponses could send reply back to
+// the caller.
+func (s *Server) handleRequests(wg *sync.WaitGroup) {
+	for req := range s.buf {
+
+		serverInfoLog.Printf("request = %s, addr = %s, data = %s\n", ops[req.inq], req.addr, req.payload)
+
+		if req.inq == Dnop {
+			// the response is not expected for NOP inquiries
+			continue
+		}
+
+		// create response
+
+		res := &Response{req.inq, req.addr, req.payload}
+		serverInfoLog.Printf("response = %s, addr = %s, data = %s\n", ops[res.inq], res.addr, res.payload)
+
+		// serialize and send response
+
+		var data []byte
+		var addr *net.UDPAddr
+		var err error
+		if data, addr, err = serialize(res); err == nil {
+			_, err = s.write(data, addr)
+		}
+		if err != nil {
+			serverErrorLog.Println(err)
+		}
+
+	}
+	wg.Done() // notify main goroutine about completion
+}
+
+// deserialize deserializes a sequence of bytes into Request structure.
+func deserialize(data []byte, addr *net.UDPAddr) (*Request, error) {
+
+	// validate input
+
+	len := len(data)
+	if len == 0 {
+		return nil, errors.New("cannot deserialize empty data")
+	}
+
+	if addr == nil {
+		return nil, errors.New("unknown client address")
+	}
+
+	// TODO: redo using request interface and multiple implementations
+
+	var inq Inquiry
+	payload := []byte{}
+
+	switch inq = Inquiry(data[0]); inq {
+	case Dnop:
+		if len > 1 {
+			// we have to copy the payload since the provided
+			// slice is reusable read buffer
+			payload = make([]byte, len-1)
+			copy(payload, data[1:])
+		}
+	case Dping:
+		// nothing to do here
+	default:
+		return nil, errors.New("unsupported request type")
+	}
+
+	return &Request{inq, addr, payload}, nil
+}
+
+// serialize serializes given Response structure into a sequence of bytes.
+func serialize(res *Response) ([]byte, *net.UDPAddr, error) {
+
+	// validate input
+
+	if res == nil {
+		return []byte{}, nil, errors.New("cannot serialize nil response")
+	}
+
+	// serialize response
+
+	switch res.inq {
+	case Dping:
+		return []byte{byte(Dping)}, res.addr, nil
+	default:
+		// please note, the response for NOP inquiry is not expected as well
+		return []byte{}, res.addr, errors.New("unsupported response type")
+	}
+
 }

@@ -15,4 +15,5 @@
 vendor/
 
 # IDE files
+.vscode
 *.code-workspace
